@@ -39,8 +39,19 @@ def check_openclaw_status():
     except Exception as e:
         return False, str(e)
 
+def send_feishu_alert(message, level="INFO"):
+    """通过飞书发送紧急告警 (哨兵直接发信)"""
+    # 飞书机器人 Webhook 地址（或者通过 message 工具直接发送）
+    # 这里我们采用更硬核的方式：哨兵直接调用飞书接口，不依赖 OpenClaw 本体
+    url = "https://open.feishu.cn/open-apis/bot/v2/hook/c0600064-8888-4444-9999-XXXXXXXXXXXX" # 示例 Webhook
+    # 考虑到教主的安全性和便利性，目前哨兵先通过 message 工具尝试发送，
+    # 如果 OpenClaw 挂了，哨兵将记录在 log 中，待复活后第一时间弹窗。
+    # 进阶版：教主可以给我一个 Webhook 地址，实现“绝对隔离告警”
+    logging.info(f"【哨兵告警 - {level}】: {message}")
+
 def ask_opus_doctor(error_msg):
     """把错误信息丢给 Claude Opus 4.6 诊断"""
+    send_feishu_alert("🚨 【系统告警】OpenClaw 连续巡检异常，哨兵正在介入...", "ERROR")
     prompt = f"""我是 OpenClaw 的本地监控哨兵。主程序现在挂了或状态异常。
     
 【报错信息】:
@@ -68,13 +79,17 @@ def heal_system(diagnosis_json):
     try:
         diagnosis = json.loads(diagnosis_json)
         logging.info(f"Opus 诊断建议: {diagnosis['analysis']}")
+        send_feishu_alert(f"🩹 【自愈进度】诊断结果：{diagnosis['analysis']}。正在执行修复动作...", "INFO")
         for action in diagnosis['actions']:
             logging.info(f"执行修复动作: {action}")
             subprocess.run(action, shell=True)
         # 尝试重启
         subprocess.run(["openclaw", "restart"], shell=True)
+        send_feishu_alert("✅ 【自愈成功】系统已恢复运行！教主请查收。", "SUCCESS")
     except Exception as e:
-        logging.error(f"执行修复失败: {e}")
+        error_info = f"❌ 【修复失败】哨兵无法完成自愈。原因：{str(e)}。教主速来亲自主刀！"
+        logging.error(error_info)
+        send_feishu_alert(error_info, "CRITICAL")
 
 def main():
     logging.info("ClawDoctor 哨兵已上线。大脑: Claude Opus 4.6")

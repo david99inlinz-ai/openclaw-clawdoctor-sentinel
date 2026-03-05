@@ -1,187 +1,202 @@
-import os
-import time
-import subprocess
-import requests
-import json
-import logging
-
-# ==========================================
-# 🧠 ClawDoctor - "不死之身" 哨兵系统 (v2.1)
-# 大脑: Claude Opus 4.6 (OpenRouter)
-# 职责: 监控、诊断、自愈、配置回滚
-# 新增: 财务探针 + 配置健康探针
-# ==========================================
-
-API_KEY = os.environ.get("CLAWDOCTOR_API_KEY", "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")
-MODEL = "anthropic/claude-opus-4.6"
-BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-
+import os, sys, time, subprocess, requests, json, fcntl, signal
 OPENCLAW_HOME = "/home/ubuntu/.openclaw"
 CONFIG_FILE = f"{OPENCLAW_HOME}/openclaw.json"
 LKG_CONFIG = f"{OPENCLAW_HOME}/openclaw.json.lkg"
 LOG_FILE = f"{OPENCLAW_HOME}/clawdoctor.log"
+PID_FILE = f"{OPENCLAW_HOME}/workspace/watchdog.pid"
+LOCK_FILE = f"{OPENCLAW_HOME}/clawdoctor.lock"
+CHECK_INTERVAL = 60
+FAIL_THRESHOLD = 3
+GATEWAY_PORT = 18789
+SERVICE_NAME = "openclaw-gateway.service"
+API_KEY = os.environ.get("CLAWDOCTOR_API_KEY", "sk-or-v1-757d33d6b3a9d76717ccca0d869de9bd3a8371ea8be1c0mondo")
+MODEL = "anthropic/claude-opus-4.6"
+BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# 财务探针：要检查余额的服务商（格式：名称 + 查询URL + 请求头）
-CREDIT_PROBES = [
-    {
-        "name": "OpenRouter",
-        "url": "https://openrouter.ai/api/v1/credits",
-        "headers": {"Authorization": f"Bearer {API_KEY}"},
-        "low_threshold": 1.0  # 低于 $1 预警
-    }
-]
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} - [ClawDoctor] - {msg}"
+    print(line, flush=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
 
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
-                    format='%(asctime)s - [ClawDoctor] - %(message)s')
-
-
-def send_feishu_alert(message, level="INFO"):
-    """通过飞书发送紧急告警"""
-    logging.info(f"【哨兵告警 - {level}】: {message}")
-    # 通过 openclaw 的 message 工具发送（如果主程序还活着）
+def acquire_lock():
+    global lock_fp
+    lock_fp = open(LOCK_FILE, 'w')
     try:
-        cmd = f'openclaw message send --channel feishu --to "ou_22bed63232b902401047fb589c17a62f" --message "{message}"'
-        subprocess.run(cmd, shell=True, timeout=10)
-    except Exception:
-        pass  # 主程序挂了就只记日志
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except IOError:
+        log("另一个 ClawDoctor 实例正在运行，退出。")
+        return False
 
+def write_pid():
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
 
-def check_openclaw_status():
-    """探针1：检查 OpenClaw 进程状态"""
+def cleanup(signum=None, frame=None):
+    log("ClawDoctor 哨兵下线。")
     try:
-        result = subprocess.run(
-            ["openclaw", "gateway", "status"],
-            capture_output=True, text=True, timeout=10
-        )
-        if "running" in result.stdout.lower():
-            return True, "Running"
-        return False, result.stdout + result.stderr
+        os.remove(PID_FILE)
+        os.remove(LOCK_FILE)
+    except:
+        pass
+    sys.exit(0)
+
+def run_cmd(cmd, timeout=10):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
     except Exception as e:
-        return False, str(e)
+        return -1, "", str(e)
 
+def check_health():
+    code, out, _ = run_cmd(["systemctl", "--user", "is-active", SERVICE_NAME])
+    if out.strip() != "active":
+        return False, f"service not active: {out.strip()}"
+    code, out, _ = run_cmd(["ss", "-tlnp"])
+    if f":{GATEWAY_PORT}" not in out:
+        return False, f"port {GATEWAY_PORT} not listening"
+    kill_orphans()
+    return True, "OK"
 
-def check_config_health():
-    """探针2：检查配置文件健康状态"""
+def kill_orphans():
     try:
-        result = subprocess.run(
-            ["openclaw", "doctor"],
-            capture_output=True, text=True, timeout=15
-        )
-        output = result.stdout + result.stderr
-        if "Invalid config" in output or "Unrecognized key" in output:
-            return False, output
-        return True, "Config OK"
-    except Exception as e:
-        return False, str(e)
+        _, pid_out, _ = run_cmd(["systemctl", "--user", "show", SERVICE_NAME, "--property=MainPID"])
+        gw_pid = pid_out.strip().split("=")[1] if "=" in pid_out else "0"
+        _, pgrep_out, _ = run_cmd(["pgrep", "-f", "openclaw"])
+        my_pid = str(os.getpid())
+        for pid in pgrep_out.strip().split("\n"):
+            pid = pid.strip()
+            if not pid or pid == gw_pid or pid == my_pid:
+                continue
+            try:
+                cmdline = open(f"/proc/{pid}/cmdline").read()
+                if any(k in cmdline for k in ["gateway", "watchdog", "clawdoctor", "logs"]):
+                    continue
+                log(f"清理孤儿进程 pid={pid}")
+                os.kill(int(pid), 9)
+            except:
+                pass
+    except:
+        pass
 
+def run_doctor():
+    log("运行 openclaw doctor --fix 尝试自愈配置...")
+    run_cmd(["openclaw", "doctor", "--fix"], timeout=60)
 
-def check_api_credits():
-    """探针3：检查 API 余额是否充足"""
-    issues = []
-    for probe in CREDIT_PROBES:
-        try:
-            resp = requests.get(
-                probe["url"],
-                headers=probe["headers"],
-                timeout=10
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                # OpenRouter 返回格式: {"data": {"total_credits": X, "usage": Y}}
-                total = data.get("data", {}).get("total_credits", 0)
-                usage = data.get("data", {}).get("usage", 0)
-                remaining = total - usage
-                if remaining < probe["low_threshold"]:
-                    issues.append(f"{probe['name']} 余额不足！剩余 ${remaining:.2f}，请教主尽快充值！")
-            elif resp.status_code in (402, 429):
-                issues.append(f"{probe['name']} 返回 {resp.status_code}，账户可能已断粮或限流！")
-        except Exception as e:
-            logging.warning(f"财务探针 {probe['name']} 检查失败: {e}")
-    return issues
+def restart_gateway():
+    log("通过 systemd 重启 gateway...")
+    run_doctor()  # 在重启前先尝试修复配置
+    run_cmd(["systemctl", "--user", "stop", SERVICE_NAME], timeout=30)
+    time.sleep(3)
+    kill_orphans()
+    time.sleep(2)
+    run_cmd(["systemctl", "--user", "start", SERVICE_NAME], timeout=30)
+    time.sleep(5)
+    code, out, _ = run_cmd(["systemctl", "--user", "is-active", SERVICE_NAME])
+    if out.strip() == "active":
+        log("gateway 重启成功")
+        return True
+    log("gateway 重启失败")
+    return False
 
-
-def ask_opus_doctor(error_msg):
-    """把错误信息丢给 Claude Opus 诊断"""
-    send_feishu_alert("🚨 【系统告警】OpenClaw 连续巡检异常，哨兵正在介入...", "ERROR")
-    prompt = f"""我是 OpenClaw 的本地监控哨兵。主程序现在挂了或状态异常。
-
-【报错信息】:
-{error_msg}
-
-请以 JSON 格式回复，包含 'analysis'（分析） 和 'actions'（修复指令列表）。"""
+def ask_opus(error_msg):
+    log("启动 Opus 会诊...")
+    prompt = f"""OpenClaw Gateway service 异常。
+【报错】: {error_msg}
+【要求】: 只用 systemctl --user 管理，不要 openclaw restart。
+回复 JSON: {{"analysis":"...","actions":["cmd1"],"need_rollback":false}}"""
     try:
-        response = requests.post(BASE_URL, json={
-            "model": MODEL,
-            "messages": [{"role": "user", "content": prompt}]
-        }, headers={"Authorization": f"Bearer {API_KEY}"}, timeout=30)
-        return response.json()['choices'][0]['message']['content']
+        resp = requests.post(BASE_URL, json={"model": MODEL, "messages": [{"role":"user","content":prompt}]}, headers={"Authorization": f"Bearer {API_KEY}"}, timeout=60)
+        data = resp.json()
+        if 'choices' in data:
+            return data['choices'][0]['message']['content']
+        log(f"Opus API 错误: {data}")
+        return None
     except Exception as e:
-        logging.error(f"无法连接到 Opus Doctor: {e}")
+        log(f"Opus 连接失败: {e}")
         return None
 
-
-def heal_system(diagnosis_json):
-    """执行修复指令"""
+def heal(diagnosis_raw):
     try:
-        diagnosis = json.loads(diagnosis_json)
-        logging.info(f"Opus 诊断建议: {diagnosis['analysis']}")
-        send_feishu_alert(f"🩹 【自愈进度】{diagnosis['analysis']}。正在执行修复...", "INFO")
-        for action in diagnosis['actions']:
-            logging.info(f"执行: {action}")
-            subprocess.run(action, shell=True)
-        subprocess.run(["systemctl", "--user", "restart", "openclaw-gateway"], shell=False)
-        send_feishu_alert("✅ 【自愈成功】系统已恢复运行！", "SUCCESS")
+        s = diagnosis_raw
+        if '```json' in s:
+            s = s.split('```json')[1].split('```')[0]
+        elif '```' in s:
+            s = s.split('```')[1].split('```')[0]
+        start, end = s.find('{'), s.rfind('}') + 1
+        if start >= 0 and end > start:
+            s = s[start:end]
+        d = json.loads(s)
+        log(f"诊断: {d.get('analysis','?')}")
+        if d.get('need_rollback') and os.path.exists(LKG_CONFIG):
+            log("回滚配置...")
+            run_cmd(["cp", LKG_CONFIG, CONFIG_FILE])
+            run_cmd(["chmod", "600", CONFIG_FILE])
+        bad = ["rm -rf", "dd if=", "mkfs", "> /dev/"]
+        for action in d.get('actions', []):
+            if any(k in action for k in bad):
+                log(f"跳过危险命令: {action}")
+                continue
+            if "openclaw restart" in action or "openclaw start" in action:
+                action = f"systemctl --user restart {SERVICE_NAME}"
+            log(f"执行: {action}")
+            run_cmd(action.split(), timeout=30)
+        restart_gateway()
     except Exception as e:
-        msg = f"❌ 【修复失败】{str(e)}。教主速来亲自主刀！"
-        logging.error(msg)
-        send_feishu_alert(msg, "CRITICAL")
+        log(f"自愈失败: {e}")
+        restart_gateway()
 
+def hard_recovery():
+    log("硬恢复...")
+    if os.path.exists(LKG_CONFIG):
+        run_cmd(["cp", LKG_CONFIG, CONFIG_FILE])
+        run_cmd(["chmod", "600", CONFIG_FILE])
+    restart_gateway()
 
 def main():
-    logging.info("ClawDoctor v2.1 哨兵已上线。新增：财务探针 + 配置健康探针")
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    if not acquire_lock():
+        sys.exit(1)
+    write_pid()
+    log("ClawDoctor v2.0 哨兵已上线。大脑: Claude Opus 4.6")
+    log(f"监控目标: systemd {SERVICE_NAME} (端口 {GATEWAY_PORT})")
     fail_count = 0
-    credit_check_counter = 0  # 每10轮（约10分钟）检查一次余额
-
     while True:
-        # === 探针1：进程状态 ===
-        is_ok, msg = check_openclaw_status()
-        if is_ok:
-            if os.path.exists(CONFIG_FILE):
-                subprocess.run(["cp", CONFIG_FILE, LKG_CONFIG])
+        ok, msg = check_health()
+        if ok:
+            if fail_count > 0:
+                log(f"系统恢复正常（此前异常 {fail_count} 次）")
+            try:
+                run_cmd(["cp", CONFIG_FILE, LKG_CONFIG])
+            except:
+                pass
             fail_count = 0
+            log("巡检正常")
         else:
             fail_count += 1
-            logging.warning(f"状态监控: 异常 (第 {fail_count} 次)")
-            if fail_count >= 3:
-                logging.error("主程序连续 3 次异常，启动 Opus 会诊...")
-                diagnosis = ask_opus_doctor(msg)
-                if diagnosis:
-                    heal_system(diagnosis)
+            log(f"异常 (第 {fail_count} 次): {msg}")
+            if fail_count >= FAIL_THRESHOLD:
+                log("尝试重启...")
+                if restart_gateway():
+                    fail_count = 0
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+                try:
+                    _, jlog, _ = run_cmd(["journalctl","--user","-u",SERVICE_NAME,"-n","50","--no-pager"])
+                    detail = f"{msg}\n\n{jlog}"
+                except:
+                    detail = msg
+                diag = ask_opus(detail)
+                if diag:
+                    heal(diag)
                 else:
-                    logging.error("无法会诊，启动硬回滚...")
-                    if os.path.exists(LKG_CONFIG):
-                        subprocess.run(["cp", LKG_CONFIG, CONFIG_FILE])
-                    subprocess.run(["systemctl", "--user", "restart", "openclaw-gateway"], shell=False)
+                    hard_recovery()
                 fail_count = 0
-
-        # === 探针2：配置健康（每5轮检查一次，约5分钟）===
-        if credit_check_counter % 5 == 0:
-            config_ok, config_msg = check_config_health()
-            if not config_ok:
-                alert = f"⚠️ 【配置异常】发现 Invalid config 错误，请教主检查！详情：{config_msg[:200]}"
-                logging.error(alert)
-                send_feishu_alert(alert, "WARN")
-
-        # === 探针3：财务余额（每10轮检查一次，约10分钟）===
-        if credit_check_counter % 10 == 0:
-            credit_issues = check_api_credits()
-            for issue in credit_issues:
-                logging.warning(issue)
-                send_feishu_alert(f"💸 【断粮预警】{issue}", "WARN")
-
-        credit_check_counter += 1
-        time.sleep(60)
-
+        time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     main()
